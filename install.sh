@@ -59,26 +59,60 @@ fi
 
 desktop_quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/[\\"`$]/\\\\&/g')"; }
 
+# exec_args EXEC - the arguments an Exec= value hands to the client itself:
+# everything after the program (after the app id for "flatpak run"), minus
+# Flatpak's @@ file-forwarding markers. "/usr/bin/discord --url -- %u" gives
+# "--url -- %u".
+exec_args() {
+  local exec=$1 i=1
+  local -a words rest out=()
+  if [[ $exec == \"* ]]; then   # quoted program path
+    exec=${exec#\"}
+    read -ra rest <<<"${exec#*\"}"
+    words=(program "${rest[@]}")
+  else
+    read -ra words <<<"$exec"
+  fi
+  if [[ ${words[0]##*/} == flatpak ]]; then
+    for ((i = 1; i < ${#words[@]}; i++)); do
+      [[ ${words[i]} == run || ${words[i]} == -* ]] || break
+    done
+    ((i++))   # the app id
+  fi
+  for ((; i < ${#words[@]}; i++)); do
+    [[ ${words[i]} == @@* ]] || out+=("${words[i]}")
+  done
+  printf '%s' "${out[*]}"
+}
+
 # point_at_detour DEST SRC APP - write DEST as a copy of the .desktop file SRC
-# that starts APP through detour. A file of the user's own at DEST is backed
-# up first (uninstall.sh puts it back).
+# whose Exec= lines start APP through detour, keeping the client's own
+# arguments (Discord's "--url -- %u" for discord:// links, "--start-minimized"
+# in autostart entries). A file of the user's own at DEST is backed up first
+# (uninstall.sh puts it back).
 point_at_detour() {
-  local dest=$1 src=$2 app=$3 extra=""
+  local dest=$1 src=$2 app=$3 line args out=""
   if [[ -f $dest ]] && ! command grep -qx "$MARKER" "$dest"; then
     mv -f "$dest" "$dest.detour-backup"
     [[ $src == "$dest" ]] && src="$dest.detour-backup"
   fi
-  # keep "start minimized" from autostart entries
-  if command grep -q '^Exec=.*--start-minimized' "$src"; then extra=" --start-minimized"; fi
-  # (values go through ENVIRON because awk -v would eat backslashes)
-  EXEC_LINE="Exec=$(desktop_quote "$DETOUR") --app $app --$extra %U" MARK="$MARKER" awk '
-    $0 == ENVIRON["MARK"] { next }
-    /^\[/ { in_main = ($0 == "[Desktop Entry]") }
-    /^Exec=/ { print ENVIRON["EXEC_LINE"]; next }
-    /^(TryExec|DBusActivatable|X-Flatpak)[^=]*=/ { next }
-    { print }
-    in_main && /^\[Desktop Entry\]$/ { print ENVIRON["MARK"] }
-  ' "$src" >"$dest.tmp"
+  # re-installing over one of ours: start again from the original
+  if command grep -qx "$MARKER" "$src" && [[ -f $src.detour-backup ]]; then
+    src="$src.detour-backup"
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    case $line in
+      "$MARKER" | TryExec=* | DBusActivatable=* | X-Flatpak*=*) continue ;;
+      Exec=*)
+        args=$(exec_args "${line#Exec=}")
+        line="Exec=$(desktop_quote "$DETOUR") --app $app --${args:+ $args}"
+        ;;
+    esac
+    out+="$line"$'\n'
+    [[ $line == "[Desktop Entry]" ]] && out+="$MARKER"$'\n'
+  done <"$src"
+  printf '%s' "$out" >"$dest.tmp"
   mv -f "$dest.tmp" "$dest"
 }
 
@@ -123,13 +157,17 @@ for app in vesktop discord discord-ptb discord-canary; do
     echo "✓ $pretty ($kind): its normal icon now picks the fastest connection"
   else
     for id in $ids; do undo_entry "$APPS_DIR/$id.desktop"; done
+    args="%U"
+    if original=$(find_original "$ids"); then
+      args=$(exec_args "$(command grep -m1 '^Exec=' "$original" | cut -d= -f2-)")
+    fi
     cat >"$separate_entry" <<EOF
 [Desktop Entry]
 Type=Application
 Name=$pretty (Detour)
 GenericName=Internet Messenger
 Comment=$pretty through the fastest connection
-Exec=$(desktop_quote "$DETOUR") --app $app -- %U
+Exec=$(desktop_quote "$DETOUR") --app $app --${args:+ $args}
 Icon=$icon
 Terminal=false
 Categories=Network;InstantMessaging;
