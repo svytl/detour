@@ -11,10 +11,11 @@
 set -uo pipefail
 shopt -s extglob
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 DEFAULT_CONFIG="$CONFIG_HOME/detour/detour.ini"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp/detour-$(id -u)}/detour"   # cleared at logout
 
 # Default local ports of common proxy apps: Xray and ss-local (1080), Throne,
 # NekoBox and sing-box (2080, 2081), Clash and mihomo (7890, 7891), Clash
@@ -469,13 +470,9 @@ detect_client() {
   die "couldn't find Vesktop or Discord - install one of them first"
 }
 
-# client_running - is the client already open? Sets VIA_DETOUR to 1 if detour
-# started it (it then has --proxy-server or --no-proxy-server).
-# Electron apps are single-instance: starting one again only brings the open
-# window to the front, and any new switches are ignored.
-client_running() {
+# find_main - find the client's main process; sets MAIN_PID and MAIN_CMDLINE.
+find_main() {
   local pid base name cmdline
-  VIA_DETOUR=0
   for pid in $(pgrep -u "$(id -u)" -f -i -- "${NATIVE_BIN%%-*}" 2>/dev/null); do
     [[ $pid == "$$" ]] && continue
     # Chromium may rewrite its title to one space-separated string, so
@@ -487,12 +484,57 @@ client_running() {
     for name in $MAIN_BINS; do
       # Native Vesktop is sometimes started by a system Electron.
       if [[ $base == "$name" || ($base == electron* && ${cmdline,,} == *"${NATIVE_BIN}"*) ]]; then
-        [[ $cmdline == *--proxy-server=* || $cmdline == *--no-proxy-server* ]] && VIA_DETOUR=1
+        MAIN_PID=$pid MAIN_CMDLINE=$cmdline
         return 0
       fi
     done
   done
   return 1
+}
+
+# client_running - is the client already open? Sets VIA_DETOUR to 1 if detour
+# started it: it then has --proxy-server or --no-proxy-server, or detour
+# started it earlier this session and it restarted itself without them
+# (Discord does after updates).
+# Electron apps are single-instance: starting one again only brings the open
+# window to the front, and any new switches are ignored.
+client_running() {
+  VIA_DETOUR=0
+  find_main || return 1
+  if [[ $MAIN_CMDLINE == *--proxy-server=* || $MAIN_CMDLINE == *--no-proxy-server* || -e $STATE_DIR/$APP ]]; then
+    VIA_DETOUR=1
+  fi
+  return 0
+}
+
+# supervise - start the client and keep it on the proxy. Discord installs its
+# own updates and then restarts itself without the switches it was started
+# with; when that happens, close it and open it again with them. Returns once
+# the client has been closed.
+supervise() {
+  local restarts=0 last_restart=0 gone=0 seen=0 started=$SECONDS
+  local -a relaunch=("${BASE_CMD[@]}" "${FLAGS[@]}")
+  "${CMD[@]}" &
+  while sleep 2; do
+    if ! find_main; then
+      # Not up yet, or closed. Allow a few checks: handing over to a newly
+      # installed version leaves a short gap.
+      if ((seen || SECONDS - started > 60)) && ((++gone >= 3)); then return; fi
+      continue
+    fi
+    seen=1 gone=0
+    [[ $MAIN_CMDLINE == *--proxy-server=* ]] && continue
+    ((SECONDS - last_restart > 600)) && restarts=0
+    if ((++restarts > 3)); then
+      alert "$PRETTY keeps restarting without the proxy. Close it and open it again from its icon."
+      return
+    fi
+    last_restart=$SECONDS
+    alert "$PRETTY restarted itself after an update. Opening it again through the proxy..."
+    kill -TERM "$MAIN_PID" 2>/dev/null
+    for _ in {1..40}; do find_main || break; sleep 0.5; done
+    "${relaunch[@]}" &
+  done
 }
 
 # ---------------------------------------------------------------- auth helper
@@ -503,7 +545,8 @@ start_auth_proxy() {
   local helper="$SELF_DIR/detour-auth-proxy.py" port=""
   command -v python3 >/dev/null 2>&1 || die "a proxy with a login needs python3 installed"
   [[ -f $helper ]] || die "missing $helper - reinstall detour"
-  # $$ stays the same after the exec below, so the helper can watch it.
+  # $$ becomes the client with the exec below (or stays detour while it
+  # supervises Discord), so the helper can watch it.
   coproc AUTHPROXY { DETOUR_UPSTREAM="$PROXY" exec python3 "$helper" --parent "$$"; }
   read -r -t 5 port <&"${AUTHPROXY[0]}" || true
   [[ $port =~ ^[0-9]+$ ]] || die "the login helper for the proxy didn't start"
@@ -628,5 +671,12 @@ fi
 if [[ -n ${AUTHPROXY_PID:-} ]]; then
   fd_in=${AUTHPROXY[0]} fd_out=${AUTHPROXY[1]}
   exec {fd_in}<&- {fd_out}>&-
+fi
+# remember that detour started this client this session (see client_running)
+mkdir -p "$STATE_DIR" 2>/dev/null && : >"$STATE_DIR/$APP" 2>/dev/null
+
+if [[ -n $PROXY && $APP == discord* ]]; then
+  supervise
+  exit 0
 fi
 exec "${CMD[@]}"

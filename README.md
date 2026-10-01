@@ -108,6 +108,8 @@ This puts your app icons back exactly as they were. Add `--purge` to delete the 
 
 Vesktop and Discord are Electron (Chromium) apps, so they accept Chromium's `--proxy-server` switch. Detour starts them with it, or with `--no-proxy-server` when direct is best. For a proxy with a login it also runs `detour-auth-proxy.py`. Chromium can't take a username and password on the command line, so this tiny local proxy on `127.0.0.1` adds the login for it, and it stops when the app does.
 
+Discord installs its own updates and then restarts itself without those switches. So when Discord is on a proxy, detour stays in the background and reopens it through the proxy after an update restart. On a direct connection it just hands over and exits.
+
 | | Flatpak | Native (AUR, .deb, .rpm, tar) |
 |---|---|---|
 | Vesktop | ✅ | ✅ |
