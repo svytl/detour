@@ -11,7 +11,7 @@
 set -uo pipefail
 shopt -s extglob
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 DEFAULT_CONFIG="$CONFIG_HOME/detour/detour.ini"
@@ -23,8 +23,10 @@ DEFAULT_CONFIG="$CONFIG_HOME/detour/detour.ini"
 KNOWN_PORTS="1080 2080 2081 7890 7891 7897 10808 10809 12334 20170 20171 20172 40000"
 # Proxy apps by process name; any port they listen on is tried as well.
 PROXY_APPS="xray|v2ray|sing-box|mihomo|clash|hiddify|throne|nekoray|nekobox|ss-local|sslocal|v2raya|trojan|hysteria|tuic|naive|gost|psiphon|karing|outline"
-# A route counts as working when all of these answer through it.
-TEST_URLS=(https://discord.com/api/v9/gateway https://gateway.discord.gg https://cdn.discordapp.com)
+# A route counts as working when all of these answer through it. The gateway
+# itself takes ~400 ms to answer a plain request, so ask Cloudflare's edge in
+# front of it instead: same host name and TLS handshake, instant answer.
+TEST_URLS=(https://discord.com/api/v9/gateway https://gateway.discord.gg/cdn-cgi/trace https://cdn.discordapp.com)
 
 usage() {
   cat <<EOF
@@ -318,10 +320,10 @@ now_ms() {
 }
 
 # score ROUTE MS - lower is better. A direct connection gets a head start: it
-# wins unless a proxy is clearly faster, since it doesn't depend on a proxy
-# app staying up.
+# wins unless a proxy is clearly faster (by more than 25% + 50 ms), since it
+# doesn't depend on a proxy app staying up.
 score() {
-  if [[ $1 == direct ]]; then echo $((($2 - 100) * 4 / 5)); else echo "$2"; fi
+  if [[ $1 == direct ]]; then echo $((($2 - 50) * 4 / 5)); else echo "$2"; fi
 }
 
 # race_routes first|all - probe every route in ROUTES at the same time and
@@ -363,7 +365,7 @@ race_routes() {
     ((pending)) || break
     if [[ $mode == first && -n $BEST ]]; then
       ((direct < 0)) || [[ $BEST == direct || -n ${results[direct]:-} ]] && break
-      ((grace)) || grace=$(($(now_ms) + BEST_MS / 4 + 100))
+      ((grace)) || grace=$(($(now_ms) + BEST_MS / 4 + 50))
       (($(now_ms) >= grace)) && break
     fi
     sleep 0.05

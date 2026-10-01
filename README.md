@@ -49,8 +49,8 @@ detour --check
 ```
 Testing routes to Discord...
   direct                             can't reach Discord
-  socks5://127.0.0.1:10808           ok, 412 ms   <- best
-  http://127.0.0.1:10809             ok, 455 ms
+  socks5://127.0.0.1:10808           ok, 142 ms   <- best
+  http://127.0.0.1:10809             ok, 158 ms
 Vesktop will connect through: socks5://127.0.0.1:10808
 ```
 
