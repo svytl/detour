@@ -1,0 +1,630 @@
+#!/usr/bin/env bash
+# detour - run Vesktop or Discord on Linux through the fastest working route.
+#
+# Vesktop and Discord are Electron (Chromium) apps, so they accept Chromium's
+# --proxy-server switch. With "proxy = auto" (the default) detour finds proxy
+# apps running on this computer, races them against a direct connection to
+# Discord and starts the client through whichever gets there first.
+# Proxies that need a login are routed through detour-auth-proxy.py, because
+# Chromium can't take proxy credentials on the command line.
+
+set -uo pipefail
+shopt -s extglob
+
+VERSION="1.0.0"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DEFAULT_CONFIG="$CONFIG_HOME/detour/detour.ini"
+
+# Default local ports of common proxy apps: Xray and ss-local (1080), Throne,
+# NekoBox and sing-box (2080, 2081), Clash and mihomo (7890, 7891), Clash
+# Verge (7897), v2rayN (10808, 10809), Hiddify (12334), v2rayA (20170-20172)
+# and Cloudflare WARP in proxy mode (40000).
+KNOWN_PORTS="1080 2080 2081 7890 7891 7897 10808 10809 12334 20170 20171 20172 40000"
+# Proxy apps by process name; any port they listen on is tried as well.
+PROXY_APPS="xray|v2ray|sing-box|mihomo|clash|hiddify|throne|nekoray|nekobox|ss-local|sslocal|v2raya|trojan|hysteria|tuic|naive|gost|psiphon|karing|outline"
+# A route counts as working when all of these answer through it.
+TEST_URLS=(https://discord.com/api/v9/gateway https://gateway.discord.gg https://cdn.discordapp.com)
+
+usage() {
+  cat <<EOF
+detour $VERSION - run Vesktop or Discord through the fastest working route
+
+Usage: detour [options] [-- arguments for the app]
+
+Options:
+  -a, --app NAME        client to start: auto, vesktop, discord, discord-ptb,
+                        discord-canary (default: from config, else auto)
+  -p, --proxy SPEC      use SPEC instead of the proxy setting in the config
+  -c, --config FILE     config file (default: $DEFAULT_CONFIG)
+      --check           test every route to Discord and show the best
+      --print           show the command that would be run, then exit
+      --set-proxy SPEC  save SPEC as the proxy setting
+      --set-app NAME    save NAME as the client to start
+      --detect          print the client that would be started, then exit
+  -h, --help            show this help
+  -V, --version         show the version
+
+SPEC is "auto" (the default), "off", or one or more proxy URLs separated by
+commas, of which the fastest working one is used. "auto" can be mixed in:
+  socks5://127.0.0.1:1080
+  http://user:password@proxy.example.com:3128
+  auto, socks5://203.0.113.5:1080
+EOF
+}
+
+NOTIFY=0   # set once we're really launching; notifications only make sense then
+
+msg() { echo "detour: $*" >&2; }
+
+# Important messages also pop up as a desktop notification when detour was
+# started from a menu entry and nobody is looking at a terminal.
+alert() {
+  msg "$*"
+  if ((NOTIFY)) && [[ ! -t 2 ]] && command -v notify-send >/dev/null 2>&1; then
+    notify-send -a Detour -i dialog-information "Detour" "$*" >/dev/null 2>&1 || true
+  fi
+}
+
+die() { alert "$*"; exit 1; }
+
+trim() {
+  local s=$1
+  s=${s##+([[:space:]])}
+  s=${s%%+([[:space:]])}
+  printf '%s' "$s"
+}
+
+# ---------------------------------------------------------------- config file
+
+# ini_get FILE KEY - print KEY from the [detour] section of FILE.
+ini_get() {
+  local file=$1 want=$2 line key val section="" result=""
+  [[ -r $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=$(trim "${line%$'\r'}")
+    [[ -z $line || $line == [\;#]* ]] && continue
+    if [[ $line == \[*\] ]]; then
+      section=$(trim "${line:1:${#line}-2}")
+      continue
+    fi
+    [[ ${section,,} == detour && $line == *=* ]] || continue
+    key=$(trim "${line%%=*}")
+    val=$(trim "${line#*=}")
+    val=$(trim "${val%%[[:space:]][;#]*}")   # inline comment
+    [[ ${key,,} == "$want" ]] && result=$val
+  done <"$file"
+  printf '%s' "$result"
+}
+
+# ini_set FILE KEY VALUE - set KEY in the [detour] section, creating the
+# file, section or key as needed. Comments and other lines are kept.
+ini_set() {
+  local file=$1 want=$2 value=$3 line trimmed key section="" done=0 out=""
+  mkdir -p "$(dirname "$file")" || return 1
+  if [[ -f $file ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      line=${line%$'\r'}
+      trimmed=$(trim "$line")
+      if [[ $trimmed == \[*\] ]]; then
+        # leaving [detour] without having seen the key: add it here
+        if [[ ${section,,} == detour && $done == 0 ]]; then
+          out+="$want = $value"$'\n'
+          done=1
+        fi
+        section=$(trim "${trimmed:1:${#trimmed}-2}")
+      elif [[ ${section,,} == detour && $trimmed == *=* && $trimmed != [\;#]* ]]; then
+        key=$(trim "${trimmed%%=*}")
+        if [[ ${key,,} == "$want" ]]; then
+          [[ $done == 0 ]] && out+="$want = $value"$'\n'
+          done=1
+          continue
+        fi
+      fi
+      out+="$line"$'\n'
+    done <"$file"
+  fi
+  if [[ $done == 0 ]]; then
+    [[ ${section,,} == detour ]] || out+=$'\n[detour]\n'
+    out+="$want = $value"$'\n'
+  fi
+  local tmp="$file.tmp.$$"
+  (umask 077 && printf '%s' "$out" >"$tmp") && mv -f "$tmp" "$file"
+}
+
+# ---------------------------------------------------------------- proxy URL
+
+# parse_proxy URL - fills P_SCHEME P_USER P_PASS P_HOST P_PORT and
+# CHROME_PROXY (what Chromium gets) and CURL_PROXY (for testing).
+parse_proxy() {
+  local url=$1 rest auth="" hostport
+  [[ $url == *://* ]] || url="http://$url"
+  P_SCHEME=${url%%://*}
+  P_SCHEME=${P_SCHEME,,}
+  rest=${url#*://}
+  if [[ $rest == *@* ]]; then
+    auth=${rest%@*}
+    hostport=${rest##*@}
+  else
+    hostport=$rest
+  fi
+  hostport=${hostport%%/*}
+  P_USER=${auth%%:*}
+  P_PASS=""
+  [[ $auth == *:* ]] && P_PASS=${auth#*:}
+
+  if [[ $hostport == \[*\]* ]]; then           # [IPv6]:port
+    P_HOST=${hostport%%]*}]
+    P_PORT=${hostport#*]}
+    P_PORT=${P_PORT#:}
+  elif [[ $hostport == *:* ]]; then
+    P_HOST=${hostport%:*}
+    P_PORT=${hostport##*:}
+  else
+    P_HOST=$hostport
+    P_PORT=""
+  fi
+
+  local chrome_scheme curl_scheme
+  case $P_SCHEME in
+    http) chrome_scheme=http; curl_scheme=http ;;
+    https) chrome_scheme=https; curl_scheme=https ;;
+    socks5 | socks5h | socks) chrome_scheme=socks5; curl_scheme=socks5h ;;
+    socks4 | socks4a) chrome_scheme=socks4; curl_scheme=socks4a ;;
+    *) die "unsupported proxy type '$P_SCHEME' (use http, https, socks5 or socks4)" ;;
+  esac
+  [[ -n $P_HOST ]] || die "proxy '$1' has no host"
+  [[ $P_PORT =~ ^[0-9]{1,5}$ ]] && ((10#$P_PORT > 0 && 10#$P_PORT < 65536)) ||
+    die "proxy '$1' needs a port, e.g. $chrome_scheme://127.0.0.1:1080"
+  if [[ -n $P_USER && $chrome_scheme == socks4 ]]; then
+    die "SOCKS4 proxies with a login aren't supported, use socks5 or http"
+  fi
+
+  P_PORT=$((10#$P_PORT))
+  CHROME_PROXY="$chrome_scheme://$P_HOST:$P_PORT"
+  CURL_PROXY="$curl_scheme://$P_HOST:$P_PORT"
+}
+
+# Decode %XX in a login or password, like Python's unquote().
+pct_decode() {
+  local s=$1 out="" ch
+  while [[ $s =~ %([0-9A-Fa-f]{2}) ]]; do
+    out+=${s%%"${BASH_REMATCH[0]}"*}
+    printf -v ch "\\x${BASH_REMATCH[1]}"
+    out+=$ch
+    s=${s#*"${BASH_REMATCH[0]}"}
+  done
+  printf '%s' "$out$s"
+}
+
+# curl_login - the proxy login as a config line for `curl -K -`. Going
+# through stdin avoids URL-escaping trouble and keeps it out of `ps`.
+curl_login() {
+  [[ -n $P_USER ]] || return 0
+  local login
+  login="$(pct_decode "$P_USER"):$(pct_decode "$P_PASS")"
+  login=${login//\\/\\\\}
+  login=${login//\"/\\\"}
+  printf 'proxy-user = "%s"\n' "$login"
+}
+
+# route_label ROUTE - a route for display, without the password.
+route_label() {
+  local r=$1 rest
+  if [[ $r == *://*@* ]]; then
+    rest=${r#*://}
+    r="${r%%://*}://${rest%%:*}:***@${rest##*@}"
+  fi
+  printf '%s' "$r"
+}
+
+port_open() {
+  local host=${1#[}
+  host=${host%]}
+  timeout 2 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$2" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- routes
+
+# local_proxies - print proxy URLs for proxy apps listening on this computer.
+# A port's type isn't known up front, so each is tried as SOCKS5 and as HTTP.
+local_proxies() {
+  local port ports=" $KNOWN_PORTS "
+  if command -v ss >/dev/null 2>&1; then
+    for port in $(ss -ltnpH 2>/dev/null | awk -v apps="$PROXY_APPS" '
+        tolower($0) ~ ("\"(" apps ")") { n = split($4, a, ":"); print a[n] }'); do
+      [[ $ports == *" $port "* ]] || ports+="$port "
+    done
+  fi
+  for port in $ports; do
+    port_open 127.0.0.1 "$port" && printf '%s\n' "socks5://127.0.0.1:$port" "http://127.0.0.1:$port"
+  done
+}
+
+# check_spec SPEC - die if SPEC has something that isn't a word we know or a
+# valid proxy URL.
+check_spec() {
+  local item
+  local -a items
+  IFS=',' read -ra items <<<"$1"
+  for item in "${items[@]}"; do
+    item=$(trim "$item")
+    case ${item,,} in
+      "" | auto | direct | off | none) ;;
+      *) parse_proxy "$item" ;;
+    esac
+  done
+}
+
+# build_routes SPEC - fill ROUTES with what to try ("direct" or proxy URLs).
+# Sets AUTO if SPEC asked for auto-detection, HAS_PROXY if any proxy is in.
+build_routes() {
+  local spec item
+  local -a items found
+  local -A seen=()
+  ROUTES=() AUTO=0 HAS_PROXY=0
+  spec=$(trim "$1")
+  IFS=',' read -ra items <<<"${spec:-auto}"
+  for item in "${items[@]}"; do
+    item=$(trim "$item")
+    case ${item,,} in
+      "") continue ;;
+      auto) AUTO=1; found=(direct $(local_proxies)) ;;
+      direct | off | none) found=(direct) ;;
+      *) parse_proxy "$item"; found=("$item") ;;
+    esac
+    for item in "${found[@]}"; do
+      [[ -n ${seen[$item]:-} ]] && continue
+      seen[$item]=1
+      ROUTES+=("$item")
+      [[ $item == direct ]] || HAS_PROXY=1
+    done
+  done
+  ((${#ROUTES[@]})) || ROUTES=(direct)
+}
+
+# probe ROUTE - time a few Discord requests through ROUTE. Prints
+# "ok <milliseconds>" or "fail <reason>".
+probe() {
+  local route=$1 url out total=0 frac login=""
+  local -a args=(-q -sS -o /dev/null -w '%{time_total} %{http_connect}' --connect-timeout 4 --max-time 6 -K -)
+  if [[ $route == direct ]]; then
+    args+=(--noproxy '*')
+  else
+    parse_proxy "$route"
+    if ! port_open "$P_HOST" "$P_PORT"; then
+      echo "fail proxy not running"
+      return
+    fi
+    args+=(-x "$CURL_PROXY")
+    login=$(curl_login)
+  fi
+  for url in "${TEST_URLS[@]}"; do
+    if ! out=$(LC_ALL=C curl "${args[@]}" "$url" 2>/dev/null <<<"$login"); then
+      if [[ $out == *" 407" ]]; then echo "fail wrong login"; else echo "fail can't reach Discord"; fi
+      return
+    fi
+    [[ $out =~ ^([0-9]+)[.,]([0-9]+) ]] || { echo "fail can't reach Discord"; return; }
+    frac=${BASH_REMATCH[2]}000
+    total=$((total + 10#${BASH_REMATCH[1]} * 1000 + 10#${frac:0:3}))
+  done
+  echo "ok $total"
+}
+
+now_ms() {
+  local t=${EPOCHREALTIME:-${SECONDS}000000}
+  t=${t//[!0-9]/}   # the decimal point depends on the locale
+  echo $((10#$t / 1000))
+}
+
+# score ROUTE MS - lower is better. A direct connection gets a head start: it
+# wins unless a proxy is clearly faster, since it doesn't depend on a proxy
+# app staying up.
+score() {
+  if [[ $1 == direct ]]; then echo $((($2 - 100) * 4 / 5)); else echo "$2"; fi
+}
+
+# race_routes first|all - probe every route in ROUTES at the same time and
+# set BEST and BEST_MS to the best working one. "first" stops as soon as a
+# route gets through (the fastest, since they all started together), after a
+# short wait for a direct connection that is still being tested; "all" waits
+# for every probe and prints a table.
+race_routes() {
+  local mode=$1 dir i result ms pending best_score="" grace=0 direct=-1
+  local deadline=$((SECONDS + 25))
+  local -a pids=() results=()
+  BEST="" BEST_MS=""
+  for i in "${!ROUTES[@]}"; do
+    [[ ${ROUTES[i]} == direct ]] && direct=$i
+  done
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/detour.XXXXXX") || return 1
+  for i in "${!ROUTES[@]}"; do
+    (
+      result=$(probe "${ROUTES[i]}")
+      printf '%s\n' "${result:-fail error}" >"$dir/$i.tmp" && mv "$dir/$i.tmp" "$dir/$i"
+    ) 2>/dev/null &
+    pids+=($!)
+  done
+  while ((SECONDS < deadline)); do
+    pending=0
+    for i in "${!ROUTES[@]}"; do
+      [[ -n ${results[i]:-} ]] && continue
+      if [[ -f $dir/$i ]]; then
+        results[i]=$(<"$dir/$i")
+        [[ ${results[i]} == "ok "* ]] || continue
+        ms=${results[i]#ok }
+        if [[ -z $best_score ]] || (($(score "${ROUTES[i]}" "$ms") < best_score)); then
+          BEST=${ROUTES[i]} BEST_MS=$ms best_score=$(score "${ROUTES[i]}" "$ms")
+        fi
+      else
+        pending=1
+      fi
+    done
+    ((pending)) || break
+    if [[ $mode == first && -n $BEST ]]; then
+      ((direct < 0)) || [[ $BEST == direct || -n ${results[direct]:-} ]] && break
+      ((grace)) || grace=$(($(now_ms) + BEST_MS / 4 + 100))
+      (($(now_ms) >= grace)) && break
+    fi
+    sleep 0.05
+  done
+  kill "${pids[@]}" 2>/dev/null
+  rm -rf "$dir"
+
+  if [[ $mode == all ]]; then
+    for i in "${!ROUTES[@]}"; do
+      result=${results[i]:-fail timed out}
+      if [[ $result == "ok "* ]]; then result="ok, ${result#ok } ms"; else result=${result#fail }; fi
+      [[ ${ROUTES[i]} == "$BEST" ]] && result+="   <- best"
+      printf '  %-34s %s\n' "$(route_label "${ROUTES[i]}")" "$result"
+    done
+  fi
+  [[ -n $BEST ]]
+}
+
+# choose_route - set PROXY to the route to launch with ("" means direct).
+choose_route() {
+  PROXY=""
+  build_routes "$SPEC"
+  if ((!AUTO && ${#ROUTES[@]} == 1)); then
+    # a single route was given: use it as it is
+    [[ ${ROUTES[0]} == direct ]] && return
+    PROXY=${ROUTES[0]}
+    parse_proxy "$PROXY"
+    if [[ $MODE == run ]] && ! port_open "$P_HOST" "$P_PORT"; then
+      alert "Can't reach the proxy at $P_HOST:$P_PORT - is your proxy app running? Starting $PRETTY anyway."
+    fi
+    return
+  fi
+
+  local give_up=$((SECONDS + 20)) warned=0
+  while ! race_routes first; do
+    if [[ $MODE != run ]] || ((SECONDS >= give_up)); then
+      [[ $MODE == run ]] && alert "No working connection to Discord found. Start your proxy app or Cloudflare WARP, then open $PRETTY again."
+      return
+    fi
+    if ((!warned)); then
+      alert "Discord looks blocked. Waiting for a proxy app (or Cloudflare WARP) to start..."
+      warned=1
+    fi
+    sleep 3
+    build_routes "$SPEC"   # a proxy app may have started meanwhile
+  done
+  [[ $BEST == direct ]] || PROXY=$BEST
+  msg "using $(route_label "$BEST") ($BEST_MS ms)"
+}
+
+# ---------------------------------------------------------------- clients
+
+flatpak_has() {
+  command -v flatpak >/dev/null 2>&1 && flatpak info "$1" >/dev/null 2>&1
+}
+
+# client_info APP - for a client name, set:
+#   FLATPAK_ID  Flatpak app id
+#   NATIVE_BIN  command name when installed natively
+#   MAIN_BINS   names of the main executable, to spot a running instance
+#   PRETTY      display name
+client_info() {
+  case $1 in
+    vesktop)
+      FLATPAK_ID=dev.vencord.Vesktop NATIVE_BIN=vesktop
+      MAIN_BINS="vesktop.bin vesktop Vesktop" PRETTY=Vesktop ;;
+    discord)
+      FLATPAK_ID=com.discordapp.Discord NATIVE_BIN=discord
+      MAIN_BINS="Discord" PRETTY=Discord ;;
+    discord-ptb)
+      FLATPAK_ID=com.discordapp.DiscordPTB NATIVE_BIN=discord-ptb
+      MAIN_BINS="DiscordPTB" PRETTY="Discord PTB" ;;
+    discord-canary)
+      FLATPAK_ID=com.discordapp.DiscordCanary NATIVE_BIN=discord-canary
+      MAIN_BINS="DiscordCanary" PRETTY="Discord Canary" ;;
+    *) die "unknown app '$1' (use auto, vesktop, discord, discord-ptb or discord-canary)" ;;
+  esac
+}
+
+# resolve_client APP - pick native or Flatpak; sets KIND and ICON as well.
+# Returns 1 if the client isn't installed.
+resolve_client() {
+  client_info "$1"
+  if command -v "$NATIVE_BIN" >/dev/null 2>&1; then
+    KIND=native ICON=$NATIVE_BIN
+  elif flatpak_has "$FLATPAK_ID"; then
+    KIND=flatpak ICON=$FLATPAK_ID
+  else
+    return 1
+  fi
+}
+
+detect_client() {
+  local app
+  for app in vesktop discord discord-ptb discord-canary; do
+    if resolve_client "$app"; then
+      APP=$app
+      return 0
+    fi
+  done
+  die "couldn't find Vesktop or Discord - install one of them first"
+}
+
+# client_running - is the client already open? Sets VIA_DETOUR to 1 if detour
+# started it (it then has --proxy-server or --no-proxy-server).
+# Electron apps are single-instance: starting one again only brings the open
+# window to the front, and any new switches are ignored.
+client_running() {
+  local pid base name cmdline
+  VIA_DETOUR=0
+  for pid in $(pgrep -u "$(id -u)" -f -i -- "${NATIVE_BIN%%-*}" 2>/dev/null); do
+    [[ $pid == "$$" ]] && continue
+    # Chromium may rewrite its title to one space-separated string, so
+    # don't rely on NUL separators here.
+    cmdline=$(tr "\0" " " 2>/dev/null <"/proc/$pid/cmdline") || continue
+    base=${cmdline%% *}
+    base=${base##*/}
+    [[ $cmdline == *--type=* ]] && continue   # Chromium helper processes
+    for name in $MAIN_BINS; do
+      # Native Vesktop is sometimes started by a system Electron.
+      if [[ $base == "$name" || ($base == electron* && ${cmdline,,} == *"${NATIVE_BIN}"*) ]]; then
+        [[ $cmdline == *--proxy-server=* || $cmdline == *--no-proxy-server* ]] && VIA_DETOUR=1
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- auth helper
+
+# Start detour-auth-proxy.py and point Chromium at it. The upstream URL goes
+# through the environment so the password doesn't show up in `ps`.
+start_auth_proxy() {
+  local helper="$SELF_DIR/detour-auth-proxy.py" port=""
+  command -v python3 >/dev/null 2>&1 || die "a proxy with a login needs python3 installed"
+  [[ -f $helper ]] || die "missing $helper - reinstall detour"
+  # $$ stays the same after the exec below, so the helper can watch it.
+  coproc AUTHPROXY { DETOUR_UPSTREAM="$PROXY" exec python3 "$helper" --parent "$$"; }
+  read -r -t 5 port <&"${AUTHPROXY[0]}" || true
+  [[ $port =~ ^[0-9]+$ ]] || die "the login helper for the proxy didn't start"
+  CHROME_PROXY="http://127.0.0.1:$port"
+}
+
+# ---------------------------------------------------------------- main
+
+CONFIG=${DETOUR_CONFIG:-}
+APP_OPT="" SPEC_OPT="" SPEC_SET=0 MODE=run
+declare -a APP_ARGS=()
+
+while (($#)); do
+  case $1 in
+    -a | --app) APP_OPT=${2:-}; shift ;;
+    -p | --proxy) SPEC_OPT=${2:-}; SPEC_SET=1; shift ;;
+    -c | --config) CONFIG=${2:-}; shift ;;
+    --check) MODE=check ;;
+    --print) MODE=print ;;
+    --detect) MODE=detect ;;
+    --set-proxy) MODE=set; SET_KEY=proxy SET_VAL=${2-}; shift ;;
+    --set-app) MODE=set; SET_KEY=app SET_VAL=${2-}; shift ;;
+    -h | --help) usage; exit 0 ;;
+    -V | --version) echo "detour $VERSION"; exit 0 ;;
+    --) shift; APP_ARGS+=("$@"); break ;;
+    *) APP_ARGS+=("$1") ;;   # e.g. discord:// links from the menu entry
+  esac
+  shift
+done
+
+if [[ -z $CONFIG ]]; then
+  CONFIG=$DEFAULT_CONFIG
+  # a detour.ini next to the script works too (portable use)
+  [[ ! -f $CONFIG && -f $SELF_DIR/detour.ini ]] && CONFIG=$SELF_DIR/detour.ini
+fi
+
+if [[ $MODE == set ]]; then
+  SET_VAL=$(trim "$SET_VAL")
+  if [[ $SET_KEY == proxy ]]; then
+    check_spec "$SET_VAL"
+  elif [[ $SET_VAL != auto ]]; then
+    client_info "$SET_VAL"
+  fi
+  ini_set "$CONFIG" "$SET_KEY" "$SET_VAL" || die "couldn't write $CONFIG"
+  echo "Saved $SET_KEY = $(route_label "$SET_VAL") in $CONFIG"
+  exit 0
+fi
+
+if ((SPEC_SET)); then
+  SPEC=$SPEC_OPT
+else
+  SPEC=$(ini_get "$CONFIG" proxy)
+fi
+SPEC=$(trim "$SPEC")
+SPEC=${SPEC:-auto}
+check_spec "$SPEC"
+
+APP=${APP_OPT:-$(ini_get "$CONFIG" app)}
+APP=${APP:-auto}
+if [[ $APP == auto ]]; then
+  detect_client
+else
+  resolve_client "$APP" || die "$PRETTY isn't installed (neither '$NATIVE_BIN' nor Flatpak $FLATPAK_ID found)"
+fi
+
+if [[ $MODE == detect ]]; then
+  echo "$APP $KIND $ICON"
+  exit 0
+fi
+
+if [[ $MODE == check ]]; then
+  command -v curl >/dev/null 2>&1 || die "--check needs curl installed"
+  build_routes "$SPEC"
+  ((AUTO && !HAS_PROXY)) && echo "No proxy apps found running on this computer."
+  echo "Testing routes to Discord..."
+  if race_routes all; then
+    echo "$PRETTY will connect through: $(route_label "$BEST")"
+  else
+    echo "Nothing gets through to Discord. Start your proxy app or Cloudflare WARP and try again."
+    exit 1
+  fi
+  exit 0
+fi
+
+if [[ $KIND == flatpak ]]; then
+  BASE_CMD=(flatpak run "$FLATPAK_ID")
+else
+  BASE_CMD=("$NATIVE_BIN")
+fi
+
+if [[ $MODE == run ]]; then
+  NOTIFY=1
+  if client_running; then
+    # Starting it again just brings the open window to the front.
+    if ((!VIA_DETOUR)); then
+      build_routes "$SPEC"
+      ((HAS_PROXY)) && alert "$PRETTY is already open without Detour. Quit it from the tray icon and open it again to use the fastest connection."
+    fi
+    exec "${BASE_CMD[@]}" "${APP_ARGS[@]}"
+  fi
+  command -v curl >/dev/null 2>&1 || die "detour needs curl installed"
+fi
+
+choose_route
+
+if [[ -n $PROXY ]]; then
+  parse_proxy "$PROXY"
+  [[ $MODE == run && -n $P_USER ]] && start_auth_proxy
+  FLAGS=("--proxy-server=$CHROME_PROXY")
+else
+  FLAGS=(--no-proxy-server)
+fi
+CMD=("${BASE_CMD[@]}" "${FLAGS[@]}" "${APP_ARGS[@]}")
+
+if [[ $MODE == print ]]; then
+  [[ -n $PROXY && -n $P_USER ]] && echo "# login proxy: a local helper on 127.0.0.1 would replace $CHROME_PROXY" >&2
+  printf '%q ' "${CMD[@]}"
+  echo
+  exit 0
+fi
+
+if [[ -n ${AUTHPROXY_PID:-} ]]; then
+  fd_in=${AUTHPROXY[0]} fd_out=${AUTHPROXY[1]}
+  exec {fd_in}<&- {fd_out}>&-
+fi
+exec "${CMD[@]}"
